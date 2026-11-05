@@ -1,0 +1,47 @@
+name: Deploy report
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check that GitHub Pages is enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          build_type=$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .build_type 2>/dev/null || true)
+          if [ "$build_type" != "workflow" ]; then
+            url="https://github.com/${GITHUB_REPOSITORY}/settings/pages"
+            echo "::error title=GitHub Pages is not set up::Open ${url}, set Source to 'GitHub Actions', then re-run this workflow."
+            {
+              echo "## ⚠️ One-time setup needed: GitHub Pages is not enabled"
+              echo
+              echo "1. Open [Settings → Pages](${url})"
+              echo "2. Under **Build and deployment → Source**, choose **GitHub Actions**"
+              echo "3. Come back here and click **Re-run jobs**"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
