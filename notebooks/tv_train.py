@@ -469,12 +469,12 @@ def train_fold(cfg, fold, images, anns, splits, run_root, device, log=print):
             scaler.step(opt)
             scaler.update()
             for k, v in losses.items():
-                sums[k] = sums.get(k, 0.0) + float(v)
+                sums[k] = sums.get(k, 0.0) + v.detach()
             n += 1
         sec = time.time() - t0
         train_sec += sec
         rec = {"epoch": epoch + 1, "lr": opt.param_groups[0]["lr"], "sec": round(sec, 1),
-               "skipped": skipped, **{k: v / max(n, 1) for k, v in sums.items()}}
+               "skipped": skipped, **{k: float(v) / max(n, 1) for k, v in sums.items()}}
         rec["loss"] = sum(v for k, v in rec.items() if k.startswith("loss_") or
                           k in ("classification", "bbox_regression"))
         if cfg.curve_every and (epoch + 1) % cfg.curve_every == 0:
