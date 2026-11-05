@@ -5,8 +5,12 @@
 - the image is resized in the worker so that its longest side == `max_side`
   (use the model with min_size=max_size=max_side so its own transform does not resize again)
 - images are returned as uint8 tensors; `to_device` converts to float on the GPU
+- `precache()` keeps the resized, ignore-filled frames in RAM (stride-20 subsets are small),
+  so epochs after the first do not decode full-resolution JPEGs again
 """
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -33,6 +37,7 @@ class VisDroneDet(Dataset):
         self.obj = {k: (g[["x", "y", "w", "h"]].to_numpy(np.float32), g["cls"].to_numpy(np.int64))
                     for k, g in obj.groupby("img_id")}
         self.ign = {k: g[["x", "y", "w", "h"]].to_numpy(np.float32) for k, g in ign.groupby("img_id")}
+        self.cache = None
 
     def __len__(self):
         return len(self.ids)
@@ -55,7 +60,8 @@ class VisDroneDet(Dataset):
         keep = ((xyxy[:, 2] - xyxy[:, 0]) >= self.min_size) & ((xyxy[:, 3] - xyxy[:, 1]) >= self.min_size)
         return img, xyxy[keep].astype(np.float32), c[keep]
 
-    def __getitem__(self, i):
+    def prepare(self, i):
+        """Loaded + resized frame: (img, boxes in network scale, labels, scale, (h, w))."""
         img, boxes, labels = self.load(i)
         h, w = img.shape[:2]
         s = 1.0
@@ -64,12 +70,22 @@ class VisDroneDet(Dataset):
             interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
             img = cv2.resize(img, (round(w * s), round(h * s)), interpolation=interp)
             boxes = boxes * s
+        return img, boxes, labels, s, (h, w)
+
+    def precache(self, num_threads=8):
+        """Decode, fill and resize every frame once and keep it in RAM (call before the DataLoader)."""
+        with ThreadPoolExecutor(num_threads) as ex:
+            self.cache = list(ex.map(self.prepare, range(len(self))))
+        return sum(c[0].nbytes for c in self.cache) / 1e9
+
+    def __getitem__(self, i):
+        img, boxes, labels, s, (h, w) = self.cache[i] if self.cache is not None else self.prepare(i)
         if self.train and random.random() < self.hflip_p:
             img = img[:, ::-1]
             W = img.shape[1]
             boxes = boxes[:, [2, 1, 0, 3]] * np.array([-1, 1, -1, 1], np.float32) \
                 + np.array([W, 0, W, 0], np.float32)
-        target = {"boxes": torch.from_numpy(np.ascontiguousarray(boxes, np.float32)).reshape(-1, 4),
+        target = {"boxes": torch.from_numpy(np.array(boxes, np.float32)).reshape(-1, 4),
                   "labels": torch.from_numpy(labels + self.label_offset),
                   "image_id": int(self.ids[i]), "scale": s, "orig_size": (h, w)}
         img = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
@@ -86,7 +102,9 @@ def seed_worker(worker_id):
     random.seed(s)
 
 
-def make_loader(ds, batch_size=4, shuffle=None, num_workers=2, seed=common.SEED):
+def make_loader(ds, batch_size=4, shuffle=None, num_workers=None, seed=common.SEED):
+    if num_workers is None:
+        num_workers = min(4, os.cpu_count() or 1)
     g = torch.Generator()
     g.manual_seed(seed)
     return DataLoader(ds, batch_size=batch_size, shuffle=ds.train if shuffle is None else shuffle,

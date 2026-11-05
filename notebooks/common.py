@@ -137,14 +137,20 @@ def _load_split(root, split):
     return images, anns
 
 
+GT_VERSION = 2  # bump when load_gt output changes (invalidates old caches)
+
+
 def load_gt(root=None, cache=None):
     """Load train+val COCO annotations into (images, anns) with global img_id.
 
     Non-target categories and iscrowd=1 boxes become ignored regions (cls=-1, iscrowd=1).
+    The competition COCO file stores every ignored region once per category (8 copies);
+    they are deduplicated here, so each region appears once (make_coco_gt re-expands it).
     """
     if cache and Path(cache).exists():
         d = pd.read_pickle(cache)
-        return d["images"], d["anns"]
+        if d.get("version") == GT_VERSION:
+            return d["images"], d["anns"]
     root = Path(root or find_data_root())
     parts = [_load_split(root, s) for s in ["train", "val"]]
     images = pd.concat([p[0] for p in parts], ignore_index=True)
@@ -157,11 +163,12 @@ def load_gt(root=None, cache=None):
     anns.insert(0, "img_id", key.reindex(pd.MultiIndex.from_arrays(
         [anns["split"], anns["orig_img"]])).to_numpy())
     anns = anns.dropna(subset=["img_id"]).astype({"img_id": np.int64})
-    anns = (anns.drop(columns=["split", "orig_img"])
+    dup = (anns["iscrowd"] == 1) & anns.duplicated(["img_id", "iscrowd", "x", "y", "w", "h"])
+    anns = (anns[~dup].drop(columns=["split", "orig_img", "category_id"])
             .sort_values(["img_id", "iscrowd"], kind="stable").reset_index(drop=True))
     images.index = images["img_id"].to_numpy()
     if cache:
-        pd.to_pickle({"images": images, "anns": anns}, cache)
+        pd.to_pickle({"version": GT_VERSION, "images": images, "anns": anns}, cache)
     return images, anns
 
 
