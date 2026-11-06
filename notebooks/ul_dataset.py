@@ -1,0 +1,461 @@
+"""Ultralytics side of HW2 (Person B): YOLO (anchor-free) and RT-DETR (query-based).
+
+Same protocol as the torchvision models (common.py): fixed 3-fold GroupKFold by clip
+(splits.json), train frames every TRAIN_STRIDE-th frame, validation frames every
+EVAL_STRIDE-th frame, IMGSZ input, equal epochs, OOF COCO metrics via common.evaluate.
+
+Data layout written to <root> (once per Kaggle session, reused by every fold/experiment):
+    <root>/filled/images/<clip>/<stem>.jpg   train frames: ignored regions painted gray (114),
+    <root>/filled/labels/<clip>/<stem>.txt   boxes >= 50 % inside ignore dropped (as tv_dataset)
+    <root>/raw/images/<clip>/<stem>.jpg      val frames: symlinks to the original (unfilled) frames
+    <root>/raw/labels/<clip>/<stem>.txt      YOLO labels of all target boxes
+    <root>/folds/fold<k>_{train,val}.txt     image lists; data_fold<k>.yaml points to them
+Ultralytics finds the label of an image by replacing /images/ with /labels/ in its path.
+
+Filled train frames are stored with the longest side <= STORE_SIDE (1280), so the same files
+serve 640 px comparison runs and higher-resolution final runs.
+
+Evaluation never uses Ultralytics' own val metric (it does not know ignored regions): we
+predict the ORIGINAL validation frames with conf=0.001 and score them with common.evaluate.
+The model after the last epoch (last.pt) is evaluated, not best.pt: best.pt is selected on
+the same OOF fold and would leak validation information into the reported metric.
+
+Sources: Ultralytics docs (train / predict arguments, dataset YAML with .txt image lists);
+torchvision-side conventions from tv_dataset.py / tv_train.py (teammate's code).
+"""
+import json
+import os
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+
+import common
+
+STORE_SIDE = 1280
+RUNTIME_FIELDS = {"workers", "device", "notes", "fps_iters", "fps_warmup", "pred_batch"}
+
+
+# ---------------------------------------------------------------- config
+@dataclass
+class Config:
+    experiment: str = "yolo_base"
+    model: str = "yolo"                  # "yolo" | "rtdetr"
+    owner: str = "B"
+    weights: str = "yolov8s.pt"          # COCO-pretrained weights
+    arch: str = ""                       # optional model YAML (e.g. yolov8s-p2.yaml); weights are transferred
+    imgsz: int = common.IMGSZ
+    train_stride: int = common.TRAIN_STRIDE
+    eval_stride: int = common.EVAL_STRIDE
+    epochs: int = 12
+    batch: int = 16
+    optimizer: str = "SGD"
+    lr0: float = 0.01
+    lrf: float = 0.01
+    momentum: float = 0.937
+    weight_decay: float = 5e-4
+    warmup_epochs: float = 1.0
+    close_mosaic: int = 3                # default 10 would switch mosaic off after epoch 2 of 12
+    amp: bool = True
+    cache: bool = False                  # "ram" is faster but Ultralytics warns it is non-deterministic
+    # loss gains / modification
+    box: float = 7.5
+    cls: float = 0.5
+    dfl: float = 1.5
+    nwd: float = 0.0                     # >0: box loss = (1-nwd)*CIoU + nwd*NWD  (see patch_nwd)
+    nwd_c: float = 12.8                  # NWD normalising constant (Wang et al. 2021, AI-TOD)
+    # RT-DETR
+    num_queries: int = 300
+    # augmentation (Ultralytics defaults unless changed)
+    mosaic: float = 1.0
+    scale: float = 0.5
+    fliplr: float = 0.5
+    # inference
+    conf: float = 0.001
+    iou: float = 0.7
+    max_det: int = 300
+    # runtime only (do not change results)
+    workers: int = 4
+    device: str = "0"
+    pred_batch: int = 16
+    fps_warmup: int = 10
+    fps_iters: int = 50
+    notes: str = ""
+
+    def key(self):
+        return {k: v for k, v in asdict(self).items() if k not in RUNTIME_FIELDS}
+
+
+def make_config(base=None, **changes):
+    return replace(base or Config(), **changes)
+
+
+# ---------------------------------------------------------------- data conversion
+def _stem(path):
+    return Path(path).stem
+
+
+def _yolo_lines(boxes_xywh, cls, w, h):
+    b = np.asarray(boxes_xywh, np.float64).reshape(-1, 4)
+    x0 = np.clip(b[:, 0], 0, w); y0 = np.clip(b[:, 1], 0, h)
+    x1 = np.clip(b[:, 0] + b[:, 2], 0, w); y1 = np.clip(b[:, 1] + b[:, 3], 0, h)
+    keep = ((x1 - x0) >= 1) & ((y1 - y0) >= 1)
+    cx, cy = (x0 + x1) / 2 / w, (y0 + y1) / 2 / h
+    bw, bh = (x1 - x0) / w, (y1 - y0) / h
+    return [f"{int(c)} {a:.6f} {b_:.6f} {c_:.6f} {d:.6f}"
+            for c, a, b_, c_, d in zip(np.asarray(cls)[keep], cx[keep], cy[keep], bw[keep], bh[keep])]
+
+
+class Converter:
+    """Writes filled train frames / raw val symlinks + YOLO labels; skips files that exist."""
+
+    def __init__(self, images, anns, root, store_side=STORE_SIDE, drop_cover=0.5,
+                 fill_value=common.FILL_VALUE):
+        self.images, self.root = images, Path(root)
+        self.store_side, self.drop_cover, self.fill_value = store_side, drop_cover, fill_value
+        obj, ign = anns[anns["iscrowd"] == 0], anns[anns["iscrowd"] == 1]
+        self.obj = {k: (g[["x", "y", "w", "h"]].to_numpy(np.float32), g["cls"].to_numpy(np.int64))
+                    for k, g in obj.groupby("img_id")}
+        self.ign = {k: g[["x", "y", "w", "h"]].to_numpy(np.float32) for k, g in ign.groupby("img_id")}
+
+    def path(self, img_id, kind):
+        r = self.images.loc[img_id]
+        return self.root / kind / "images" / r["clip"] / f"{_stem(r['path'])}.jpg"
+
+    def _write_filled(self, iid):
+        out = self.path(iid, "filled")
+        lab = Path(str(out).replace("/images/", "/labels/")).with_suffix(".txt")
+        if out.exists() and lab.exists():
+            return
+        r = self.images.loc[iid]
+        img = cv2.imread(r["path"], cv2.IMREAD_COLOR)
+        h, w = img.shape[:2]
+        b, c = self.obj.get(iid, (np.zeros((0, 4), np.float32), np.zeros(0, np.int64)))
+        reg = self.ign.get(iid)
+        if reg is not None and len(reg):
+            m = common.ignore_mask(h, w, reg)
+            img[m.astype(bool)] = self.fill_value
+            if len(b):
+                keep = common.box_coverage(b, m) < self.drop_cover
+                b, c = b[keep], c[keep]
+        s = min(1.0, self.store_side / max(h, w))
+        if s < 1:
+            img = cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        lab.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        lab.write_text("\n".join(_yolo_lines(b, c, w, h)))  # normalised: independent of resize
+
+    def _write_raw(self, iid):
+        out = self.path(iid, "raw")
+        lab = Path(str(out).replace("/images/", "/labels/")).with_suffix(".txt")
+        if out.exists() and lab.exists():
+            return
+        r = self.images.loc[iid]
+        b, c = self.obj.get(iid, (np.zeros((0, 4), np.float32), np.zeros(0, np.int64)))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        lab.parent.mkdir(parents=True, exist_ok=True)
+        if not out.exists():
+            os.symlink(r["path"], out)
+        lab.write_text("\n".join(_yolo_lines(b, c, int(r["width"]), int(r["height"]))))
+
+    def write(self, img_ids, kind, threads=8):
+        fn = self._write_filled if kind == "filled" else self._write_raw
+        t0 = time.time()
+        with ThreadPoolExecutor(threads) as ex:
+            list(ex.map(fn, [int(i) for i in img_ids]))
+        return time.time() - t0
+
+
+def prepare_fold(conv, splits, fold, cfg, threads=8):
+    """Write the frames of one fold and its dataset YAML; returns the YAML path.
+
+    fold == "all": every clip is used for training (final / leaderboard model);
+    a small raw val list (fold 0 val frames) is kept only so Ultralytics can run.
+    """
+    images = conv.images
+    if fold == "all":
+        tr = common.subsample(images, cfg.train_stride)
+        va = common.fold_images(images, splits, 0, "val", max(cfg.eval_stride, 40))
+    else:
+        tr = common.fold_images(images, splits, fold, "train", cfg.train_stride)
+        va = common.fold_images(images, splits, fold, "val", cfg.eval_stride)
+    conv.write(tr["img_id"], "filled", threads)
+    conv.write(va["img_id"], "raw", threads)
+    d = conv.root / "folds"
+    d.mkdir(parents=True, exist_ok=True)
+    tag = f"fold{fold}_s{cfg.train_stride}_e{cfg.eval_stride}"
+    (d / f"{tag}_train.txt").write_text("\n".join(str(conv.path(i, "filled")) for i in tr["img_id"]))
+    (d / f"{tag}_val.txt").write_text("\n".join(str(conv.path(i, "raw")) for i in va["img_id"]))
+    yaml = d / f"data_{tag}.yaml"
+    names = "\n".join(f"  {i}: {n}" for i, n in enumerate(common.CLASSES))
+    yaml.write_text(f"path: {d}\ntrain: {d / (tag + '_train.txt')}\nval: {d / (tag + '_val.txt')}\n"
+                    f"names:\n{names}\n")
+    return yaml, tr, va
+
+
+# ---------------------------------------------------------------- NWD loss (optional)
+def nwd(box1, box2, c=12.8, eps=1e-7):
+    """Normalized Wasserstein Distance between xyxy boxes (Wang et al., 2021, arXiv:2110.13389)."""
+    import torch
+    cx1, cy1 = (box1[..., 0] + box1[..., 2]) / 2, (box1[..., 1] + box1[..., 3]) / 2
+    cx2, cy2 = (box2[..., 0] + box2[..., 2]) / 2, (box2[..., 1] + box2[..., 3]) / 2
+    w1, h1 = box1[..., 2] - box1[..., 0], box1[..., 3] - box1[..., 1]
+    w2, h2 = box2[..., 2] - box2[..., 0], box2[..., 3] - box2[..., 1]
+    d2 = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2 + ((w1 - w2) ** 2 + (h1 - h2) ** 2) / 4
+    return torch.exp(-torch.sqrt(d2 + eps) / c)
+
+
+def patch_nwd(ratio, c=12.8):
+    """Mix NWD into the YOLO box loss: loss_iou = (1-r)*(1-CIoU) + r*(1-NWD).
+
+    Monkeypatches ultralytics.utils.loss.BboxLoss.forward (Ultralytics 8.4). Boxes there are
+    in grid units (pixels / stride); they are multiplied by the per-anchor stride so NWD and
+    its constant c are in input pixels, as in the paper. DFL is unchanged.
+    Returns a function that restores the original forward.
+    """
+    from ultralytics.utils import loss as L
+    orig = L.BboxLoss.forward
+    if ratio <= 0:
+        return lambda: None
+
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores,
+                target_scores_sum, fg_mask, imgsz, stride):
+        loss_iou, loss_dfl = orig(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
+                                  target_scores, target_scores_sum, fg_mask, imgsz, stride)
+        idx = fg_mask.nonzero(as_tuple=True)
+        weight = target_scores[idx].sum(-1, keepdim=True)
+        pb, tb = (pred_bboxes * stride)[idx], (target_bboxes * stride)[idx]
+        loss_nwd = ((1.0 - nwd(pb, tb, c=c).unsqueeze(-1)) * weight).sum() / target_scores_sum
+        return (1 - ratio) * loss_iou + ratio * loss_nwd, loss_dfl
+
+    L.BboxLoss.forward = forward
+    return lambda: setattr(L.BboxLoss, "forward", orig)
+
+
+# ---------------------------------------------------------------- model / training
+def build_model(cfg):
+    """COCO-pretrained Ultralytics model (optionally another architecture YAML with weights transferred)."""
+    if cfg.model == "rtdetr":
+        from ultralytics import RTDETR
+        if cfg.num_queries != 300:
+            return _rtdetr_with_queries(cfg)
+        return RTDETR(cfg.weights)
+    from ultralytics import YOLO
+    if cfg.arch:
+        return YOLO(cfg.arch).load(cfg.weights)   # transfer matching layers (e.g. the P2 head is new)
+    return YOLO(cfg.weights)
+
+
+def _rtdetr_with_queries(cfg):
+    """RT-DETR with a different number of decoder queries; pretrained weights are transferred
+    (queries are selected from encoder features, so no weight depends on their number)."""
+    import yaml as pyyaml
+    from ultralytics import RTDETR
+    from ultralytics.utils import ROOT
+    src = ROOT / "cfg" / "models" / "rt-detr" / (cfg.arch or cfg.weights.replace(".pt", ".yaml"))
+    d = pyyaml.safe_load(src.read_text())
+    head = d["head"][-1]          # [[P3, P4, P5], 1, RTDETRDecoder, [nc]]
+    head[-1] = ["nc", 256, cfg.num_queries]  # parsed as RTDETRDecoder(nc, ch, hd=256, nq)
+    out = Path("/tmp") / f"rtdetr_nq{cfg.num_queries}.yaml"
+    out.write_text(pyyaml.safe_dump(d, sort_keys=False))
+    return RTDETR(str(out)).load(cfg.weights)
+
+
+def train_args(cfg, data_yaml, project, name):
+    a = dict(data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.imgsz, batch=cfg.batch,
+             optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf, momentum=cfg.momentum,
+             weight_decay=cfg.weight_decay, warmup_epochs=cfg.warmup_epochs,
+             close_mosaic=cfg.close_mosaic, amp=cfg.amp, cache=cfg.cache,
+             mosaic=cfg.mosaic, scale=cfg.scale, fliplr=cfg.fliplr,
+             seed=common.SEED, deterministic=True, workers=cfg.workers, device=cfg.device,
+             project=str(Path(project).resolve()), name=name, exist_ok=True, plots=False, verbose=False,
+             max_det=cfg.max_det, val=True)
+    if cfg.model == "yolo":
+        a.update(box=cfg.box, cls=cfg.cls, dfl=cfg.dfl)
+    return a
+
+
+def train_fold(cfg, data_yaml, run_dir):
+    """Train (or resume) one fold; returns path to last.pt and training minutes."""
+    run_dir = Path(run_dir)
+    last = run_dir / "train" / "weights" / "last.pt"
+    restore = patch_nwd(cfg.nwd, cfg.nwd_c) if cfg.model == "yolo" else (lambda: None)
+    t0 = time.time()
+    try:
+        if last.exists() and not (run_dir / "train_done").exists():
+            from ultralytics import RTDETR, YOLO
+            (RTDETR if cfg.model == "rtdetr" else YOLO)(str(last)).train(resume=True)
+        elif not last.exists():
+            build_model(cfg).train(**train_args(cfg, data_yaml, run_dir, "train"))
+    finally:
+        restore()
+    (run_dir / "train_done").touch()
+    return last, (time.time() - t0) / 60
+
+
+# ---------------------------------------------------------------- prediction
+def load_trained(cfg, weights):
+    from ultralytics import RTDETR, YOLO
+    return (RTDETR if cfg.model == "rtdetr" else YOLO)(str(weights))
+
+
+def _prec(cfg):
+    """fp16 inference on GPU (Ultralytics 8.4 replaced `half` with `quantize`)."""
+    return 16 if cfg.amp and cfg.device != "cpu" else None
+
+
+def predict(model, paths, keys, cfg, imgsz=None, augment=False):
+    """Predict image files; boxes are returned in ORIGINAL pixels (Ultralytics rescales them).
+
+    keys: img_id (int, validation) or image_id (str, test), one per path.
+    """
+    rows = []
+    imgsz = imgsz or cfg.imgsz
+    for i in range(0, len(paths), cfg.pred_batch):
+        res = model.predict(list(paths[i:i + cfg.pred_batch]), imgsz=imgsz, conf=cfg.conf,
+                            iou=cfg.iou, max_det=cfg.max_det, quantize=_prec(cfg), augment=augment,
+                            device=cfg.device, verbose=False)
+        for k, r in zip(keys[i:i + cfg.pred_batch], res):
+            b = r.boxes
+            if b is None or len(b) == 0:
+                continue
+            xyxy = b.xyxy.float().cpu().numpy()
+            rows.append(pd.DataFrame({"key": k, "cls": b.cls.int().cpu().numpy(),
+                                      "score": b.conf.float().cpu().numpy(),
+                                      "x": xyxy[:, 0], "y": xyxy[:, 1],
+                                      "w": xyxy[:, 2] - xyxy[:, 0], "h": xyxy[:, 3] - xyxy[:, 1]}))
+    cols = ["key", "cls", "score", "x", "y", "w", "h"]
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=cols)
+
+
+def measure_fps(model, paths, cfg, imgsz=None):
+    """Images/s at batch 1 (includes pre/post-processing), same convention as tv_train."""
+    import torch
+    imgsz = imgsz or cfg.imgsz
+    paths = list(paths)[: cfg.fps_warmup + cfg.fps_iters]
+    kw = dict(imgsz=imgsz, conf=cfg.conf, iou=cfg.iou, max_det=cfg.max_det, quantize=_prec(cfg),
+              device=cfg.device, verbose=False)
+    for p in paths[: cfg.fps_warmup]:
+        model.predict(p, **kw)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for p in paths[cfg.fps_warmup:]:
+        model.predict(p, **kw)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    n = len(paths) - cfg.fps_warmup
+    return n / (time.time() - t0) if n > 0 else float("nan")
+
+
+# ---------------------------------------------------------------- experiment loop
+def run_experiment(cfg, images, anns, splits, folds, run_root, results_csv, conv,
+                   log=True, threads=8):
+    """Train + predict every fold in `folds` (finished folds are skipped) and log OOF metrics
+    once all 3 folds are done. Returns the OOF metrics table (or None if folds are missing)."""
+    exp_dir = Path(run_root) / cfg.experiment
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = exp_dir / "config.json"
+    if cfg_file.exists() and json.loads(cfg_file.read_text()) != cfg.key():
+        raise ValueError(f"{cfg_file} has another config; use a new experiment name")
+    cfg_file.write_text(json.dumps(cfg.key(), indent=1))
+    for k in folds:
+        fdir = exp_dir / f"fold{k}"
+        if (fdir / "done.json").exists():
+            print(f"[{cfg.experiment}] fold {k}: done, skipped")
+            continue
+        common.seed_everything()
+        yaml, tr, va = prepare_fold(conv, splits, k, cfg, threads)
+        print(f"[{cfg.experiment}] fold {k}: {len(tr)} train / {len(va)} val frames")
+        last, minutes = train_fold(cfg, yaml, fdir)
+        model = load_trained(cfg, last)
+        p = predict(model, va["path"].tolist(), va["img_id"].tolist(), cfg)
+        p.rename(columns={"key": "img_id"}).to_csv(fdir / "preds.csv.gz", index=False)
+        fps = measure_fps(model, va["path"].tolist(), cfg)
+        hist = _history(fdir)
+        (fdir / "done.json").write_text(json.dumps({"fps": fps, "train_min": minutes,
+                                                    "history": hist}))
+        shutil.copy(last, fdir / "final.pt")
+        print(f"[{cfg.experiment}] fold {k}: {minutes:.1f} min, {fps:.1f} FPS")
+    return finish_experiment(cfg, images, anns, splits, run_root, results_csv, log)
+
+
+def _history(fdir):
+    f = Path(fdir) / "train" / "results.csv"
+    if not f.exists():
+        return []
+    h = pd.read_csv(f)
+    h.columns = [c.strip() for c in h.columns]
+    return h.to_dict("records")
+
+
+def load_fold_preds(run_root, experiment):
+    out = {}
+    for k in range(common.N_FOLDS):
+        f = Path(run_root) / experiment / f"fold{k}" / "preds.csv.gz"
+        if f.exists():
+            out[k] = pd.read_csv(f)
+    return out
+
+
+def load_done(run_root, experiment):
+    out = {}
+    for k in range(common.N_FOLDS):
+        f = Path(run_root) / experiment / f"fold{k}" / "done.json"
+        if f.exists():
+            out[k] = json.loads(f.read_text())
+    return out
+
+
+def finish_experiment(cfg, images, anns, splits, run_root, results_csv, log=True):
+    preds, done = load_fold_preds(run_root, cfg.experiment), load_done(run_root, cfg.experiment)
+    if len(preds) < common.N_FOLDS:
+        print(f"[{cfg.experiment}] {len(preds)}/{common.N_FOLDS} folds finished; OOF metrics later")
+        return None
+    m = common.evaluate_oof(preds, images, anns, splits, cfg.eval_stride, per_class=True)
+    marker = Path(run_root) / cfg.experiment / "logged"
+    if log and not marker.exists():
+        common.log_results(m, results_csv, owner=cfg.owner, model=cfg.model,
+                           experiment=cfg.experiment, train_stride=cfg.train_stride,
+                           eval_stride=cfg.eval_stride, imgsz=cfg.imgsz, epochs=cfg.epochs,
+                           fps=round(float(np.mean([d["fps"] for d in done.values()])), 2),
+                           train_min=round(float(np.sum([d["train_min"] for d in done.values()])), 1),
+                           notes=cfg.notes)
+        marker.touch()
+    return m
+
+
+# ---------------------------------------------------------------- test submission
+def predict_test(model, cfg, root=None, imgsz=None, augment=False):
+    t = common.load_test_index(root)
+    p = predict(model, t["path"].tolist(), t["image_id"].tolist(), cfg, imgsz=imgsz, augment=augment)
+    return p.rename(columns={"key": "image_id"}), t
+
+
+def restore_from_inputs(run_root, input_root="/kaggle/input"):
+    """Copy finished folds (done.json + preds + final.pt) from attached outputs of earlier
+    notebook versions, so a new Kaggle session continues instead of retraining."""
+    run_root = Path(run_root)
+    n = 0
+    for done in Path(input_root).glob("**/ul_runs/*/fold*/done.json"):
+        fdir = done.parent
+        dst = run_root / fdir.parent.name / fdir.name
+        if (dst / "done.json").exists():
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in ["done.json", "preds.csv.gz", "final.pt"]:
+            if (fdir / f).exists():
+                shutil.copy(fdir / f, dst / f)
+        (dst / "train_done").touch()
+        cfgf = fdir.parent / "config.json"
+        if cfgf.exists() and not (dst.parent / "config.json").exists():
+            shutil.copy(cfgf, dst.parent / "config.json")
+        n += 1
+    print(f"restored {n} finished folds from {input_root}")
+    return n
