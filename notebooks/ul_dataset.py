@@ -438,12 +438,26 @@ def predict_test(model, cfg, root=None, imgsz=None, augment=False):
     return p.rename(columns={"key": "image_id"}), t
 
 
+def _input_files(input_root, pattern, max_depth=3):
+    """Files matching `pattern` under attached inputs, WITHOUT scanning the competition data
+    (a recursive glob over its ~77k files on Kaggle's network disk takes minutes)."""
+    root = Path(input_root)
+    if not root.exists():
+        return []
+    skip = {"competitions", common.SLUG}
+    out = []
+    for top in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in skip):
+        for d in range(max_depth + 1):
+            out += sorted(top.glob("/".join(["*"] * d + [pattern])))
+    return out
+
+
 def restore_from_inputs(run_root, input_root="/kaggle/input"):
     """Copy finished folds (done.json + preds + final.pt) from attached outputs of earlier
     notebook versions, so a new Kaggle session continues instead of retraining."""
     run_root = Path(run_root)
     n = 0
-    for done in Path(input_root).glob("**/ul_runs/*/fold*/done.json"):
+    for done in _input_files(input_root, "ul_runs/*/fold*/done.json"):
         fdir = done.parent
         dst = run_root / fdir.parent.name / fdir.name
         if (dst / "done.json").exists():
