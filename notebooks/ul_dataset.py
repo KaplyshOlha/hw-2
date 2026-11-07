@@ -71,6 +71,7 @@ class Config:
     nwd_c: float = 12.8                  # NWD normalising constant (Wang et al. 2021, AI-TOD)
     # RT-DETR
     num_queries: int = 300
+    backbone_lr_mult: float = 1.0        # <1: backbone (layers 0-9 of rtdetr-l) trained with lr0 * mult
     # augmentation (Ultralytics defaults unless changed)
     mosaic: float = 1.0
     scale: float = 0.5
@@ -267,6 +268,32 @@ def _rtdetr_with_queries(cfg):
     return RTDETR(str(out)).load(cfg.weights)
 
 
+def backbone_lr_trainer(mult, n_backbone=10):
+    """RT-DETR trainer whose optimizer gives the backbone (first `n_backbone` layers; 0-9 = HGNetv2
+    in rtdetr-l.yaml) a learning rate lr0 * mult; the encoder/decoder keep lr0. Every Ultralytics
+    parameter group (weights / bn / bias) is split in two, so weight decay and bias warmup are kept;
+    the LambdaLR schedule then scales each group from its own initial lr."""
+    from ultralytics.models.rtdetr.train import RTDETRTrainer
+    from ultralytics.utils.torch_utils import unwrap_model
+
+    class BackboneLRTrainer(RTDETRTrainer):
+        def build_optimizer(self, model, *args, **kwargs):
+            opt = super().build_optimizer(model, *args, **kwargs)
+            bb = {id(p) for m in unwrap_model(model).model[:n_backbone] for p in m.parameters()}
+            extra = []
+            for g in opt.param_groups:
+                back = [p for p in g["params"] if id(p) in bb]
+                g["params"] = [p for p in g["params"] if id(p) not in bb]
+                if back:
+                    extra.append({**{k: v for k, v in g.items() if k != "params"},
+                                  "params": back, "lr": g["lr"] * mult})
+            for g in extra:
+                opt.add_param_group(g)
+            return opt
+
+    return BackboneLRTrainer
+
+
 def train_args(cfg, data_yaml, project, name):
     a = dict(data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.imgsz, batch=cfg.batch,
              optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf, momentum=cfg.momentum,
@@ -288,11 +315,14 @@ def train_fold(cfg, data_yaml, run_dir):
     restore = patch_nwd(cfg.nwd, cfg.nwd_c) if cfg.model == "yolo" else (lambda: None)
     t0 = time.time()
     try:
+        extra = {}
+        if cfg.model == "rtdetr" and cfg.backbone_lr_mult != 1.0:
+            extra["trainer"] = backbone_lr_trainer(cfg.backbone_lr_mult)
         if last.exists() and not (run_dir / "train_done").exists():
             from ultralytics import RTDETR, YOLO
-            (RTDETR if cfg.model == "rtdetr" else YOLO)(str(last)).train(resume=True)
+            (RTDETR if cfg.model == "rtdetr" else YOLO)(str(last)).train(resume=True, **extra)
         elif not last.exists():
-            build_model(cfg).train(**train_args(cfg, data_yaml, run_dir, "train"))
+            build_model(cfg).train(**train_args(cfg, data_yaml, run_dir, "train"), **extra)
     finally:
         restore()
     (run_dir / "train_done").touch()
@@ -362,8 +392,12 @@ def run_experiment(cfg, images, anns, splits, folds, run_root, results_csv, conv
     exp_dir = Path(run_root) / cfg.experiment
     exp_dir.mkdir(parents=True, exist_ok=True)
     cfg_file = exp_dir / "config.json"
-    if cfg_file.exists() and json.loads(cfg_file.read_text()) != cfg.key():
-        raise ValueError(f"{cfg_file} has another config; use a new experiment name")
+    if cfg_file.exists():
+        old, new, default = json.loads(cfg_file.read_text()), cfg.key(), Config().key()
+        # fields added to Config later are fine as long as they keep their default value
+        diff = {k for k in old if old[k] != new.get(k)} | {k for k in new if k not in old and new[k] != default[k]}
+        if diff:
+            raise ValueError(f"{cfg_file} has another config ({sorted(diff)}); use a new experiment name")
     cfg_file.write_text(json.dumps(cfg.key(), indent=1))
     for k in folds:
         fdir = exp_dir / f"fold{k}"
