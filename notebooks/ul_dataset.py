@@ -240,8 +240,30 @@ def patch_nwd(ratio, c=12.8):
 
 
 # ---------------------------------------------------------------- model / training
+def ensure_weights(name, tries=8, wait=60):
+    """Pretrained weights: local file, else a copy from attached inputs (e.g. an earlier notebook
+    output), else download with retries (GitHub release downloads sometimes return 5xx)."""
+    from ultralytics.utils.downloads import attempt_download_asset
+    if Path(name).exists() or not str(name).endswith(".pt"):
+        return name
+    found = _input_files("/kaggle/input", Path(name).name)
+    if found:
+        shutil.copy(found[0], name)
+        print(f"{name}: copied from {found[0]}")
+        return name
+    for i in range(tries):
+        try:
+            return attempt_download_asset(name)
+        except Exception as e:  # noqa: BLE001
+            if i == tries - 1:
+                raise
+            print(f"download of {name} failed ({type(e).__name__}); retry {i + 1}/{tries - 1} in {wait}s", flush=True)
+            time.sleep(wait)
+
+
 def build_model(cfg):
     """COCO-pretrained Ultralytics model (optionally another architecture YAML with weights transferred)."""
+    ensure_weights(cfg.weights)
     if cfg.model == "rtdetr":
         from ultralytics import RTDETR
         if cfg.num_queries != 300:
@@ -386,11 +408,17 @@ def measure_fps(model, paths, cfg, imgsz=None):
 
 # ---------------------------------------------------------------- experiment loop
 def run_experiment(cfg, images, anns, splits, folds, run_root, results_csv, conv,
-                   log=True, threads=8):
+                   log=True, threads=8, redo=()):
     """Train + predict every fold in `folds` (finished folds are skipped) and log OOF metrics
-    once all 3 folds are done. Returns the OOF metrics table (or None if folds are missing)."""
+    once all 3 folds are done. Returns the OOF metrics table (or None if folds are missing).
+    redo: folds to retrain from scratch even if finished (e.g. a fold whose training diverged)."""
     exp_dir = Path(run_root) / cfg.experiment
     exp_dir.mkdir(parents=True, exist_ok=True)
+    for k in redo:
+        if (exp_dir / f"fold{k}").exists():
+            shutil.rmtree(exp_dir / f"fold{k}")
+            (exp_dir / "logged").unlink(missing_ok=True)   # OOF metrics are logged again as a new run
+            print(f"[{cfg.experiment}] fold {k}: removed for retraining")
     cfg_file = exp_dir / "config.json"
     if cfg_file.exists():
         old, new, default = json.loads(cfg_file.read_text()), cfg.key(), Config().key()
