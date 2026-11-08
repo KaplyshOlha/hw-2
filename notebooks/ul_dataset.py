@@ -60,6 +60,7 @@ class Config:
     momentum: float = 0.937
     weight_decay: float = 5e-4
     warmup_epochs: float = 1.0
+    warmup_bias_lr: float = 0.1          # Ultralytics default (tuned for YOLO+SGD); 0 = no bias-lr spike
     close_mosaic: int = 3                # default 10 would switch mosaic off after epoch 2 of 12
     amp: bool = True
     cache: bool = False                  # "ram" is faster but Ultralytics warns it is non-deterministic
@@ -320,6 +321,7 @@ def train_args(cfg, data_yaml, project, name):
     a = dict(data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.imgsz, batch=cfg.batch,
              optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf, momentum=cfg.momentum,
              weight_decay=cfg.weight_decay, warmup_epochs=cfg.warmup_epochs,
+             warmup_bias_lr=cfg.warmup_bias_lr,
              close_mosaic=cfg.close_mosaic, amp=cfg.amp, cache=cfg.cache,
              mosaic=cfg.mosaic, scale=cfg.scale, fliplr=cfg.fliplr,
              seed=common.SEED, deterministic=True, workers=cfg.workers, device=cfg.device,
