@@ -1,6 +1,6 @@
 """Shared train / predict / evaluate loop for the torchvision detectors (HW2, Person A).
 
-Used by 02_faster_rcnn.ipynb now and by the RetinaNet notebook later.
+Used by 02_faster_rcnn.ipynb and 03_retinanet.ipynb.
 
 Pipeline per fold: build model -> precache frames (tv_dataset) -> SGD + warmup + multistep LR
 with AMP -> checkpoint every epoch -> predict val frames -> FPS (batch 1) -> save preds.
@@ -16,7 +16,8 @@ Run directory layout (all small except final.pt):
 
 Sources: torchvision detection reference scripts (SGD, warmup, AMP);
 mmdetection faster_rcnn_r50_fpn_giou_1x config (GIoU weight 10 on decoded boxes);
-Rezatofighi et al. 2019 (GIoU); Goyal et al. 2017 (linear LR scaling, warmup).
+Rezatofighi et al. 2019 (GIoU); Goyal et al. 2017 (linear LR scaling, warmup);
+Lin et al. 2017 (RetinaNet / focal loss: prior bias init, fg/bg IoU 0.5/0.4).
 """
 import json
 import os
@@ -38,9 +39,11 @@ from torchvision.models.detection import (FasterRCNN, FasterRCNN_ResNet50_FPN_We
 from torchvision.models.detection._utils import overwrite_eps
 from torchvision.models.detection.backbone_utils import _resnet_fpn_extractor
 from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection._utils import Matcher
+from torchvision.models.detection.image_list import ImageList
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.retinanet import (RetinaNetClassificationHead,
-                                                    RetinaNetRegressionHead)
+                                                    RetinaNetRegressionHead, _default_anchorgen)
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.rpn import RPNHead
 from torchvision.ops import box_iou, generalized_box_iou_loss, sigmoid_focal_loss
@@ -105,6 +108,7 @@ class Config:
     focal_gamma: float = 2.0
     fg_iou_thresh: float = 0.5
     bg_iou_thresh: float = 0.4
+    retina_reg_loss: str = "l1"         # "l1" (torchvision default) | "smooth_l1" | "giou" | "diou" | "ciou"
     # runtime only (do not change results)
     num_workers: int = 2
     fps_warmup: int = 10
@@ -272,9 +276,15 @@ def build_model(cfg, fold=0):
         ch = model.backbone.out_channels
         if n != model.head.regression_head.bbox_reg.out_channels // 4:
             model.head.regression_head = RetinaNetRegressionHead(ch, n)
+        old = model.head.classification_head
         head = FocalClassificationHead(ch, n, cfg.num_classes)
+        if old.num_anchors == n:
+            head.conv.load_state_dict(old.conv.state_dict())  # keep the COCO conv tower
         head.alpha, head.gamma = cfg.focal_alpha, cfg.focal_gamma
         model.head.classification_head = head
+        if cfg.retina_reg_loss not in ("l1", "smooth_l1", "giou", "diou", "ciou"):
+            raise ValueError(f"unknown retina_reg_loss {cfg.retina_reg_loss}")
+        model.head.regression_head._loss_type = cfg.retina_reg_loss
     else:
         raise ValueError(f"unknown model {cfg.model}")
     return set_backbone_amp(model, cfg.amp)
@@ -364,7 +374,9 @@ def check_config(cfg, exp_dir):
     p = Path(exp_dir) / "config.json"
     if p.exists():
         old = json.loads(p.read_text())
-        diff = {k: (old.get(k), v) for k, v in cfg.key().items() if old.get(k) != v}
+        default = Config().key()
+        diff = {k: (old.get(k), v) for k, v in cfg.key().items()
+                if old.get(k, default.get(k)) != v}
         if diff:
             raise ValueError(f"{cfg.experiment}: config differs from the saved run {diff}. "
                              "Use a new EXPERIMENT name or delete the old run directory.")
@@ -681,10 +693,11 @@ def summary(results_path, model=None, owner=None, experiments=None):
     for exp, g in r.groupby("experiment", sort=False):
         g = g.set_index("fold")
         row = {"experiment": exp}
-        for m in ["mAP", "AP50", "AP75", "AP_small", "AP_medium", "AR500"]:
-            row[f"{m}_oof"] = g.loc["oof", m] if "oof" in g.index else np.nan
-            row[f"{m}_mean"] = g.loc["mean", m] if "mean" in g.index else np.nan
-            row[f"{m}_std"] = g.loc["std", m] if "std" in g.index else np.nan
+        for m in ["mAP", "AP50", "AP75", "AP_small", "AP_medium", "AP_large", "AR500"]:
+            ok = m in g.columns
+            row[f"{m}_oof"] = g.loc["oof", m] if ok and "oof" in g.index else np.nan
+            row[f"{m}_mean"] = g.loc["mean", m] if ok and "mean" in g.index else np.nan
+            row[f"{m}_std"] = g.loc["std", m] if ok and "std" in g.index else np.nan
         for c in common.CLASSES:
             if f"AP_{c}" in g.columns and "oof" in g.index:
                 row[f"AP_{c}"] = g.loc["oof", f"AP_{c}"]
@@ -865,3 +878,85 @@ def draw_errors(img_id, images, anns, gt, dt, crop=None):
         x0, y0, x1, y1 = crop
         img = img[y0:y1, x0:x1]
     return img
+
+
+# ---------------------------------------------------------------- RetinaNet anchor analysis
+def anchor_generator(cfg, fold=0):
+    """AnchorGenerator that build_model would use for cfg (RetinaNet)."""
+    anchors = resolve_anchors(cfg, fold)
+    return AnchorGenerator(*anchors) if anchors is not None else _default_anchorgen()
+
+
+def _grid_anchors(gen, h, w, strides=(8, 16, 32, 64, 128), divisible=32):
+    """All anchors (xyxy) for an h x w network input padded like GeneralizedRCNNTransform."""
+    H, W = int(np.ceil(h / divisible) * divisible), int(np.ceil(w / divisible) * divisible)
+    feats = []
+    for s in strides:
+        fh, fw = (H // s, W // s) if s <= 32 else (int(np.ceil(feats[-1].shape[-2] / 2)),
+                                                    int(np.ceil(feats[-1].shape[-1] / 2)))
+        feats.append(torch.zeros(1, 1, fh, fw))
+    return gen(ImageList(torch.zeros(1, 3, H, W), [(h, w)]), feats)[0], [f.shape[-2] * f.shape[-1] for f in feats]
+
+
+@torch.no_grad()
+def anchor_match_stats(cfgs, ds, fold=0, thresholds=((0.5, 0.4),), max_images=200):
+    """How RetinaNet's IoU matcher assigns anchors to GT boxes, without training a model.
+
+    cfgs: {name: Config}; ds: training VisDroneDet (boxes at network scale, ignore-filtered).
+    Uses torchvision's Matcher(fg, bg, allow_low_quality_matches=True) exactly as RetinaNet does.
+    Returns (gt, img): per-GT rows (side, best IoU, positives, level of the best anchor) and
+    per-image rows (anchors, positives, ignored 'between' anchors, negatives).
+    """
+    sub = replace_subset(ds, max(1, len(ds) // max_images))
+    samples = []
+    for i in range(len(sub)):
+        img, boxes, _, _, _ = sub.cache[i] if sub.cache is not None else sub.prepare(i)
+        samples.append((img.shape[0], img.shape[1], torch.from_numpy(np.asarray(boxes, np.float32))))
+    gts, ims = [], []
+    for name, cfg in cfgs.items():
+        gen, cache = anchor_generator(cfg, fold), {}
+        for h, w, b in samples:
+            if (h, w) not in cache:
+                a, counts = _grid_anchors(gen, h, w)
+                per_loc = gen.num_anchors_per_location()
+                lvl = torch.cat([torch.full((c * k,), j) for j, (c, k) in enumerate(zip(counts, per_loc))])
+                cache[(h, w)] = (a, lvl)
+            a, lvl = cache[(h, w)]
+            iou = box_iou(b, a) if len(b) else None
+            side = (b[:, 2:] - b[:, :2]).clamp(min=0).prod(1).sqrt().numpy() if len(b) else np.zeros(0)
+            for fg, bg in thresholds:
+                tag = dict(variant=name, fg=fg, bg=bg)
+                if iou is None:
+                    ims.append({**tag, "anchors": len(a), "pos": 0, "between": 0, "neg": len(a), "n_gt": 0})
+                    continue
+                m = Matcher(fg, bg, allow_low_quality_matches=True)(iou)
+                npos = torch.bincount(m[m >= 0], minlength=len(b)).numpy()
+                best = iou.max(1)
+                gts.append(pd.DataFrame({**tag, "side": side, "best_iou": best.values.numpy(),
+                                         "n_pos": npos, "natural_pos": (best.values >= fg).numpy(),
+                                         "best_level": lvl[best.indices].numpy() + 3}))
+                ims.append({**tag, "anchors": len(a), "pos": int((m >= 0).sum()),
+                            "between": int((m == Matcher.BETWEEN_THRESHOLDS).sum()),
+                            "neg": int((m == Matcher.BELOW_LOW_THRESHOLD).sum()), "n_gt": len(b)})
+    gt = pd.concat(gts, ignore_index=True) if gts else pd.DataFrame(
+        columns=["variant", "fg", "bg", "side", "best_iou", "n_pos", "natural_pos", "best_level"])
+    gt["size_bin"] = _size_bin(gt["side"].astype(float))
+    return gt, pd.DataFrame(ims)
+
+
+def f1_threshold(preds, images, anns, img_ids, grid=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6), step=4):
+    """Score threshold with the best F1 (IoU 0.5, same class) on every `step`-th frame.
+
+    Focal-loss sigmoid scores and softmax scores are calibrated differently, so error
+    analyses of two detectors are compared each at its own F1-optimal threshold.
+    """
+    ids = np.unique(np.asarray(img_ids, dtype=np.int64))[::step]
+    rows = []
+    for t in grid:
+        gt, dt = error_analysis(preds, images, anns, ids, score_thr=t)
+        tp = int((dt["type"] == "tp").sum()) if len(dt) else 0
+        p, r = tp / max(len(dt), 1), tp / max(len(gt), 1)
+        rows.append({"thr": t, "precision": p, "recall": r, "f1": 2 * p * r / max(p + r, 1e-9),
+                     "dets_per_frame": len(dt) / max(len(ids), 1)})
+    df = pd.DataFrame(rows).set_index("thr")
+    return float(df["f1"].idxmax()), df
