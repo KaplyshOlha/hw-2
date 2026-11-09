@@ -358,15 +358,51 @@ def _atomic_save(obj, path):
 
 
 def save_final_weights(model, path):
-    sd = {k: (v.half() if v.is_floating_point() else v) for k, v in model.state_dict().items()}
+    """fp16 parameters + fp32 buffers. FrozenBN buffers must stay fp32: with eps=0 a tiny
+    running_var underflows to 0 in fp16 and the reloaded model outputs NaN."""
+    params = {n for n, _ in model.named_parameters()}
+    sd = {k: (v.half() if k in params and v.is_floating_point() else v)
+          for k, v in model.state_dict().items()}
     _atomic_save(sd, path)
 
 
+def _frozen_bn_keys(model):
+    return {f"{n}.{b}" for n, m in model.named_modules() if isinstance(m, FrozenBatchNorm2d)
+            for b in ("weight", "bias", "running_mean", "running_var")}
+
+
+def check_frozen_bn(model):
+    """Raise if any frozen BatchNorm scale is not finite (corrupted weights)."""
+    for n, m in model.named_modules():
+        if isinstance(m, FrozenBatchNorm2d):
+            scale = m.weight * (m.running_var + m.eps).rsqrt()
+            if not torch.isfinite(scale).all():
+                raise ValueError(f"non-finite frozen BN scale in {n}; checkpoint is corrupted")
+
+
 def load_weights(model, path, device="cpu"):
+    """Load final.pt. Old checkpoints saved FrozenBN buffers in fp16; these buffers are never
+    trained, so they are taken from the COCO weights the model was built with instead."""
     sd = torch.load(path, map_location=device, weights_only=True)
     ref = model.state_dict()
-    model.load_state_dict({k: v.to(ref[k].dtype) for k, v in sd.items()})
+    bn = _frozen_bn_keys(model)
+    legacy = any(sd[k].dtype == torch.float16 for k in bn if k in sd)
+    if legacy:
+        sd = {k: v for k, v in sd.items() if k not in bn}
+    missing, unexpected = model.load_state_dict({k: v.to(ref[k].dtype) for k, v in sd.items()},
+                                                strict=False)
+    if unexpected or set(missing) - (bn if legacy else set()):
+        raise KeyError(f"checkpoint mismatch: missing {missing[:5]}, unexpected {unexpected[:5]}")
+    check_frozen_bn(model)
     return model
+
+
+def _model_for_checkpoint(cfg, fold, path, device):
+    """Model with final weights; builds with COCO weights when an old fp16 checkpoint needs them."""
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    legacy = any(k.endswith("running_var") and v.dtype == torch.float16 for k, v in sd.items())
+    model = build_model(replace(cfg, pretrained=cfg.pretrained and legacy), fold)
+    return load_weights(model, path).to(device)
 
 
 def check_config(cfg, exp_dir):
@@ -553,8 +589,8 @@ def predict_from_checkpoints(cfg, images, anns, splits, run_root, device, folds=
         if folds is not None and k not in folds:
             continue
         _, va = make_datasets(cfg, images, anns, splits, k, precache=False)
-        model = build_model(replace(cfg, pretrained=False), k)
-        model = load_weights(model, Path(run_root) / cfg.experiment / f"fold{k}" / "final.pt").to(device)
+        model = _model_for_checkpoint(cfg, k, Path(run_root) / cfg.experiment / f"fold{k}" / "final.pt",
+                                      device)
         if rpn_topn is not None:
             set_rpn_topn(model, *rpn_topn)
         t0 = time.time()
@@ -568,8 +604,8 @@ def predict_from_checkpoints(cfg, images, anns, splits, run_root, device, folds=
 
 def load_model(cfg, fold, run_root, device):
     """Model of a finished fold with its final weights, in eval mode."""
-    model = build_model(replace(cfg, pretrained=False), fold)
-    return load_weights(model, Path(run_root) / cfg.experiment / f"fold{fold}" / "final.pt").to(device).eval()
+    return _model_for_checkpoint(cfg, fold, Path(run_root) / cfg.experiment / f"fold{fold}" / "final.pt",
+                                 device).eval()
 
 
 def load_fold_preds(run_root, experiment, folds=None):
