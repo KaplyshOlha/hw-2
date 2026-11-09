@@ -346,9 +346,9 @@ def _rng_state():
 def _set_rng_state(s):
     random.setstate(s["py"])
     np.random.set_state(s["np"])
-    torch.set_rng_state(s["torch"])
+    torch.set_rng_state(s["torch"].cpu())  # torch.load(map_location=cuda) moves RNG states to the GPU
     if "cuda" in s and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(s["cuda"])
+        torch.cuda.set_rng_state_all([t.cpu() for t in s["cuda"]])
 
 
 def _atomic_save(obj, path):
