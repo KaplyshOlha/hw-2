@@ -73,6 +73,9 @@ class Config:
     # RT-DETR
     num_queries: int = 300
     backbone_lr_mult: float = 1.0        # <1: backbone (layers 0-9 of rtdetr-l) trained with lr0 * mult
+    num_denoising: int = 100             # RT-DETR denoising queries (0 = no denoising loss)
+    rt_bbox_gain: float = 5.0            # RT-DETR loss weights of the L1 and GIoU box terms (Ultralytics defaults)
+    rt_giou_gain: float = 2.0
     # augmentation (Ultralytics defaults unless changed)
     mosaic: float = 1.0
     scale: float = 0.5
@@ -240,6 +243,26 @@ def patch_nwd(ratio, c=12.8):
     return lambda: setattr(L.BboxLoss, "forward", orig)
 
 
+def patch_rtdetr_loss(bbox=5.0, giou=2.0):
+    """RT-DETR loss with other weights of the box terms: loss = class + bbox * L1 + giou * GIoU.
+
+    Monkeypatches RTDETRDetectionModel.init_criterion (Ultralytics 8.4; defaults class 1, bbox 5,
+    giou 2). The Hungarian matcher costs are unchanged, so only the training signal changes, not
+    which query is matched to which object. Returns a function that restores the original.
+    """
+    from ultralytics.nn.tasks import RTDETRDetectionModel
+    orig = RTDETRDetectionModel.init_criterion
+    if bbox == 5.0 and giou == 2.0:
+        return lambda: None
+
+    def init_criterion(self):
+        from ultralytics.models.utils.loss import RTDETRDetectionLoss
+        return RTDETRDetectionLoss(nc=self.nc, use_vfl=True, loss_gain={"class": 1, "bbox": bbox, "giou": giou})
+
+    RTDETRDetectionModel.init_criterion = init_criterion
+    return lambda: setattr(RTDETRDetectionModel, "init_criterion", orig)
+
+
 # ---------------------------------------------------------------- model / training
 def ensure_weights(name, tries=8, wait=60):
     """Pretrained weights: local file, else a copy from attached inputs (e.g. an earlier notebook
@@ -267,18 +290,76 @@ def build_model(cfg):
     ensure_weights(cfg.weights)
     if cfg.model == "rtdetr":
         from ultralytics import RTDETR
-        if cfg.num_queries != 300:
+        if cfg.num_queries != 300 or cfg.num_denoising != 100:
             return _rtdetr_with_queries(cfg)
         return RTDETR(cfg.weights)
     from ultralytics import YOLO
     if cfg.arch:
+        if cfg.arch in CUSTOM_YOLO:
+            return _load_custom_yolo(custom_yolo_yaml(cfg.arch), cfg.weights)
         return YOLO(cfg.arch).load(cfg.weights)   # transfer matching layers (e.g. the P2 head is new)
     return YOLO(cfg.weights)
 
 
+# Custom YOLOv8 heads. The layers of yolov8.yaml keep their indices (0-21), so every pretrained
+# layer that is kept is transferred; new layers are appended after them, and the new detection level
+# is the last input of Detect (its regression / classification branches cv2.k, cv3.k for the old
+# levels keep their indices and shapes, so they are transferred as well).
+CUSTOM_YOLO = {
+    # P2 level (stride 4): upsample the P3 output (layer 15) and fuse it with backbone layer 2 (stride 4)
+    "yolov8s-p2last.yaml": dict(drop_p5=False, p2=True),
+    # no P5 level (stride 32): the bottom-up path stops at P4 (layers 19-21 removed)
+    "yolov8s-nop5.yaml": dict(drop_p5=True, p2=False),
+    # both: levels P3, P4, P2
+    "yolov8s-p2last-nop5.yaml": dict(drop_p5=True, p2=True),
+}
+
+
+def _load_custom_yolo(yaml_path, weights):
+    """Build a custom YOLOv8 and transfer the pretrained weights by layer; the pretrained Detect
+    (layer 22 of yolov8.yaml) is mapped to the index of the new Detect, whose first levels are the
+    same P3 / P4 (/ P5) branches. Prints how many tensors were transferred."""
+    from ultralytics import YOLO
+    from ultralytics.utils.torch_utils import intersect_dicts
+    model = YOLO(str(yaml_path))
+    det = len(model.model.model) - 1
+    pre = YOLO(weights).model.float().state_dict()   # Ultralytics resolves / downloads the file itself
+    pre = {(f"model.{det}." + k[len("model.22."):] if k.startswith("model.22.") else k): v for k, v in pre.items()}
+    sd = model.model.state_dict()
+    inter = intersect_dicts(pre, sd)
+    model.model.load_state_dict(inter, strict=False)
+    model.overrides.pop("pretrained", None)
+    model.ckpt, model.ckpt_path = {"model": model.model}, None   # train() then starts from these weights
+    new = sorted({int(k.split(".")[1]) for k in sd if k not in inter})
+    print(f"{Path(yaml_path).name}: transferred {len(inter)}/{len(sd)} tensors; new or partly new layers {new}")
+    return model
+
+
+def custom_yolo_yaml(name):
+    import yaml as pyyaml
+    from ultralytics.utils import ROOT
+    spec = CUSTOM_YOLO[name]
+    d = pyyaml.safe_load((ROOT / "cfg" / "models" / "v8" / "yolov8.yaml").read_text())
+    d["scale"] = name.split("-")[0][-1]              # "s" from "yolov8s-..."
+    head = d["head"][:-1]                            # layers 10-21 (Detect removed)
+    levels = [15, 18, 21]
+    if spec["drop_p5"]:
+        head, levels = head[:-3], [15, 18]           # remove layers 19-21 (P5 path)
+    if spec["p2"]:
+        n = 10 + len(head)                           # index of the first new layer
+        head += [[15, 1, "nn.Upsample", [None, 2, "nearest"]],
+                 [[-1, 2], 1, "Concat", [1]],
+                 [-1, 3, "C2f", [128]]]
+        levels.append(n + 2)
+    d["head"] = head + [[levels, 1, "Detect", ["nc"]]]
+    out = Path("/tmp") / name
+    out.write_text(pyyaml.safe_dump(d, sort_keys=False))
+    return out
+
+
 def _rtdetr_with_queries(cfg):
-    """RT-DETR with a different number of decoder queries; pretrained weights are transferred
-    (queries are selected from encoder features, so no weight depends on their number)."""
+    """RT-DETR with a different number of decoder queries and/or denoising queries; pretrained weights
+    are transferred (queries are selected from encoder features, so no weight depends on their number)."""
     import yaml as pyyaml
     from ultralytics import RTDETR
     from ultralytics.utils import ROOT
@@ -286,7 +367,10 @@ def _rtdetr_with_queries(cfg):
     d = pyyaml.safe_load(src.read_text())
     head = d["head"][-1]          # [[P3, P4, P5], 1, RTDETRDecoder, [nc]]
     head[-1] = ["nc", 256, cfg.num_queries]  # parsed as RTDETRDecoder(nc, ch, hd=256, nq)
-    out = Path("/tmp") / f"rtdetr_nq{cfg.num_queries}.yaml"
+    if cfg.num_denoising != 100:
+        # RTDETRDecoder(nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act, eval_idx, nd): defaults except nd
+        head[-1] += [4, 8, 6, 1024, 0.0, None, -1, cfg.num_denoising]
+    out = Path("/tmp") / f"rtdetr_nq{cfg.num_queries}_nd{cfg.num_denoising}.yaml"
     out.write_text(pyyaml.safe_dump(d, sort_keys=False))
     return RTDETR(str(out)).load(cfg.weights)
 
@@ -336,7 +420,8 @@ def train_fold(cfg, data_yaml, run_dir):
     """Train (or resume) one fold; returns path to last.pt and training minutes."""
     run_dir = Path(run_dir)
     last = run_dir / "train" / "weights" / "last.pt"
-    restore = patch_nwd(cfg.nwd, cfg.nwd_c) if cfg.model == "yolo" else (lambda: None)
+    restore = (patch_nwd(cfg.nwd, cfg.nwd_c) if cfg.model == "yolo"
+               else patch_rtdetr_loss(cfg.rt_bbox_gain, cfg.rt_giou_gain))
     t0 = time.time()
     try:
         extra = {}
